@@ -92,6 +92,7 @@ class Profile:
 class TelegramGroup:
     group_id: int
     title: str
+    chat_kind: str
 
 
 @dataclass(slots=True)
@@ -111,4 +112,3 @@ class ClockCheck:
     ok: bool
     drift_seconds: float | None
     message: str
-

@@ -11,7 +11,7 @@ from typing import Callable
 import qrcode
 from PIL import ImageTk
 
-from telegram_sender.models import AppConfig, Profile, RunConfig, RunResult
+from telegram_sender.models import AppConfig, Profile, RunConfig, RunResult, TelegramGroup
 from telegram_sender.paths import APP_CONFIG_PATH, PROFILES_PATH, RUNS_LOG_PATH, SESSIONS_PATH, ensure_data_dir
 from telegram_sender.security import SessionVault, SessionVaultError
 from telegram_sender.send_engine import SendEngine
@@ -35,7 +35,7 @@ class TelegramSenderApp:
             raise RuntimeError("Aplicacao encerrada sem senha mestra.")
 
         self.profile_items: dict[str, Profile] = {}
-        self.group_items: dict[str, int] = {}
+        self.group_items: dict[str, TelegramGroup] = {}
         self.run_thread: threading.Thread | None = None
         self.run_stop_event = threading.Event()
         self.qr_window: tk.Toplevel | None = None
@@ -271,8 +271,9 @@ class TelegramSenderApp:
             self.group_items.clear()
             labels = []
             for group in groups:
-                label = f"{group.title} ({group.group_id})"
-                self.group_items[label] = group.group_id
+                kind_label = self._map_kind_label(group.chat_kind)
+                label = f"{group.title} ({group.group_id}) - {kind_label}"
+                self.group_items[label] = group
                 labels.append(label)
             self.group_combo["values"] = labels
             if labels:
@@ -329,15 +330,19 @@ class TelegramSenderApp:
             return
 
         group_label = self.group_var.get().strip()
-        group_id = self.group_items.get(group_label)
-        if group_id is None:
+        selected_group = self.group_items.get(group_label)
+        if selected_group is None:
             messagebox.showerror("Erro", "Selecione um grupo valido.", parent=self.root)
             return
+        if selected_group.chat_kind == "channel":
+            self._append_status(
+                "Aviso: este destino e um canal. Geralmente canais sao somente leitura para membros."
+            )
 
         message_text = self.message_text.get("1.0", "end").strip()
         run_config = RunConfig(
             profile_id=profile.profile_id,
-            group_id=group_id,
+            group_id=selected_group.group_id,
             message_text=message_text,
             target_time_local=self.target_time_var.get().strip(),
         )
@@ -491,6 +496,16 @@ class TelegramSenderApp:
         self.status_text.insert("end", f"[{stamp}] {message}\n")
         self.status_text.see("end")
         self.status_text.configure(state="disabled")
+
+    @staticmethod
+    def _map_kind_label(kind: str) -> str:
+        if kind == "group":
+            return "Grupo"
+        if kind == "supergroup":
+            return "Supergrupo"
+        if kind == "channel":
+            return "Canal"
+        return "Desconhecido"
 
 
 def run_app() -> None:

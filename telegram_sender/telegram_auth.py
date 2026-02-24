@@ -63,11 +63,9 @@ async def list_groups(session_string: str, api_id: int, api_hash: str) -> list[T
 
         groups: list[TelegramGroup] = []
         async for dialog in client.iter_dialogs():
-            is_group_dialog = dialog.is_group
-            is_mega_group = dialog.is_channel and bool(getattr(dialog.entity, "megagroup", False))
-            if is_group_dialog or is_mega_group:
-                peer_id = int(get_peer_id(dialog.entity))
-                groups.append(TelegramGroup(group_id=peer_id, title=dialog.title or str(peer_id)))
+            parsed = _dialog_to_group(dialog)
+            if parsed is not None:
+                groups.append(parsed)
         groups.sort(key=lambda item: item.title.lower())
         return groups
     finally:
@@ -90,3 +88,32 @@ def _compose_display_name(first_name: str | None, last_name: str | None, user_id
     if pieces:
         return f"{' '.join(pieces)} ({user_id})"
     return f"Conta {user_id}"
+
+
+def _dialog_to_group(dialog) -> TelegramGroup | None:
+    entity = getattr(dialog, "entity", None)
+    if entity is None:
+        return None
+
+    is_group_dialog = bool(getattr(dialog, "is_group", False))
+    is_channel_dialog = bool(getattr(dialog, "is_channel", False))
+    is_mega_group = is_channel_dialog and bool(getattr(entity, "megagroup", False))
+    is_broadcast_channel = is_channel_dialog and bool(getattr(entity, "broadcast", False))
+
+    if not (is_group_dialog or is_mega_group or is_broadcast_channel):
+        return None
+
+    peer_id = int(get_peer_id(entity))
+    title = getattr(dialog, "title", None) or str(peer_id)
+    chat_kind = _resolve_chat_kind(is_group_dialog, is_mega_group, is_broadcast_channel)
+    return TelegramGroup(group_id=peer_id, title=title, chat_kind=chat_kind)
+
+
+def _resolve_chat_kind(is_group: bool, is_mega_group: bool, is_broadcast_channel: bool) -> str:
+    if is_group:
+        return "group"
+    if is_mega_group:
+        return "supergroup"
+    if is_broadcast_channel:
+        return "channel"
+    return "unknown"
