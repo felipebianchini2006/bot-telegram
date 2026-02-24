@@ -1,0 +1,2 @@
+"""Telegram sender MVP package."""
+

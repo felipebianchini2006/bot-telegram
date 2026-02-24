@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import asyncio
+import random
+import threading
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
+
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
+from telegram_sender.models import RunConfig, RunResult, RunStatus
+from telegram_sender.time_engine import compute_target_datetime, compute_warmup_datetime, format_countdown
+
+StatusCallback = Callable[[str], None]
+SleepCallable = Callable[[float], Awaitable[None]]
+NowCallable = Callable[[], datetime]
+UniformCallable = Callable[[int, int], float]
+
+
+@dataclass(slots=True)
+class SendEngine:
+    client_factory: Callable[[str, int, str], Any] | None = None
+    now_provider: NowCallable | None = None
+    sleep_callable: SleepCallable = asyncio.sleep
+    uniform_callable: UniformCallable = random.uniform
+
+    async def run(
+        self,
+        run_config: RunConfig,
+        session_string: str,
+        api_id: int,
+        api_hash: str,
+        stop_event: threading.Event | None = None,
+        status_callback: StatusCallback | None = None,
+    ) -> RunResult:
+        run_config.validate()
+        now = self._now
+        emit = status_callback or (lambda message: None)
+        stop = stop_event or threading.Event()
+        first_attempt_at: datetime | None = None
+        attempts_count = 0
+
+        target_at = compute_target_datetime(
+            run_config.target_time_local,
+            now(),
+            rollover_grace_seconds=run_config.max_attempt_window_sec,
+        )
+        warmup_at = compute_warmup_datetime(target_at, run_config.warmup_seconds)
+        deadline = target_at + timedelta(seconds=run_config.max_attempt_window_sec)
+        emit(
+            "Execucao agendada para "
+            f"{target_at.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(warmup em {warmup_at.strftime('%H:%M:%S')})."
+        )
+
+        client = self._create_client(session_string, api_id, api_hash)
+
+        try:
+            connected = await self._ensure_connected(client, emit)
+            if not connected:
+                return self._result(
+                    RunStatus.NETWORK_ERROR,
+                    first_attempt_at,
+                    None,
+                    attempts_count,
+                    "Nao foi possivel conectar ao Telegram.",
+                )
+            authorized = await client.is_user_authorized()
+            if not authorized:
+                return self._result(
+                    RunStatus.AUTH_ERROR,
+                    first_attempt_at,
+                    None,
+                    attempts_count,
+                    "Sessao nao autorizada. Refaca login via QR.",
+                )
+
+            group_entity = await client.get_entity(run_config.group_id)
+
+            warmup_ready = await self._wait_until(
+                warmup_at,
+                stop,
+                emit,
+                "Aguardando warmup",
+            )
+            if not warmup_ready:
+                return self._result(
+                    RunStatus.TIMEOUT,
+                    first_attempt_at,
+                    None,
+                    attempts_count,
+                    "Execucao interrompida antes do warmup.",
+                )
+            emit("Warmup iniciado. Conexao estabilizada.")
+
+            target_ready = await self._wait_until(
+                target_at,
+                stop,
+                emit,
+                "Aguardando horario alvo",
+            )
+            if not target_ready:
+                return self._result(
+                    RunStatus.TIMEOUT,
+                    first_attempt_at,
+                    None,
+                    attempts_count,
+                    "Execucao interrompida antes do horario alvo.",
+                )
+            emit("Janela de envio iniciada.")
+
+            while now() <= deadline:
+                if stop.is_set():
+                    return self._result(
+                        RunStatus.TIMEOUT,
+                        first_attempt_at,
+                        None,
+                        attempts_count,
+                        "Execucao interrompida manualmente.",
+                    )
+
+                attempts_count += 1
+                if first_attempt_at is None:
+                    first_attempt_at = now()
+
+                try:
+                    await client.send_message(group_entity, run_config.message_text)
+                    success_at = now()
+                    emit(f"Mensagem enviada com sucesso na tentativa {attempts_count}.")
+                    return self._result(
+                        RunStatus.SUCCESS,
+                        first_attempt_at,
+                        success_at,
+                        attempts_count,
+                        None,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    flood_seconds = self._extract_flood_wait_seconds(error)
+                    if flood_seconds is not None:
+                        projected = now() + timedelta(seconds=flood_seconds)
+                        if projected > deadline:
+                            emit(f"FloodWait de {flood_seconds}s excede a janela restante.")
+                            return self._result(
+                                RunStatus.FLOODWAIT_EXCEEDED,
+                                first_attempt_at,
+                                None,
+                                attempts_count,
+                                f"FloodWait de {flood_seconds}s.",
+                            )
+                        emit(f"FloodWait detectado: aguardando {flood_seconds}s.")
+                        await self.sleep_callable(float(flood_seconds))
+                        continue
+
+                    if self._is_permission_error(error):
+                        return self._result(
+                            RunStatus.PERMISSION_ERROR,
+                            first_attempt_at,
+                            None,
+                            attempts_count,
+                            str(error),
+                        )
+
+                    if self._is_auth_error(error):
+                        return self._result(
+                            RunStatus.AUTH_ERROR,
+                            first_attempt_at,
+                            None,
+                            attempts_count,
+                            str(error),
+                        )
+
+                    emit(f"Falha de rede na tentativa {attempts_count}: {error}. Reconectando...")
+                    reconnected = await self._reconnect(client, emit)
+                    if not reconnected:
+                        return self._result(
+                            RunStatus.NETWORK_ERROR,
+                            first_attempt_at,
+                            None,
+                            attempts_count,
+                            f"Falha ao reconectar: {error}",
+                        )
+                    wait_seconds = self.uniform_callable(run_config.retry_min_ms, run_config.retry_max_ms) / 1000.0
+                    await self.sleep_callable(wait_seconds)
+                    continue
+
+            return self._result(
+                RunStatus.TIMEOUT,
+                first_attempt_at,
+                None,
+                attempts_count,
+                "Janela de tentativa encerrada sem envio confirmado.",
+            )
+        finally:
+            await self._safe_disconnect(client)
+
+    @property
+    def _now(self) -> NowCallable:
+        if self.now_provider is not None:
+            return self.now_provider
+        return lambda: datetime.now().astimezone()
+
+    def _create_client(self, session_string: str, api_id: int, api_hash: str) -> Any:
+        if self.client_factory is not None:
+            return self.client_factory(session_string, api_id, api_hash)
+        return TelegramClient(StringSession(session_string), api_id, api_hash)
+
+    async def _ensure_connected(self, client: Any, emit: StatusCallback) -> bool:
+        try:
+            await client.connect()
+            return True
+        except Exception as error:  # noqa: BLE001
+            emit(f"Falha inicial de conexao: {error}")
+            return False
+
+    async def _reconnect(self, client: Any, emit: StatusCallback) -> bool:
+        await self._safe_disconnect(client)
+        try:
+            await client.connect()
+            emit("Reconectado ao Telegram.")
+            return True
+        except Exception as error:  # noqa: BLE001
+            emit(f"Reconexao falhou: {error}")
+            return False
+
+    async def _safe_disconnect(self, client: Any) -> None:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            return
+
+    async def _wait_until(
+        self,
+        target_at: datetime,
+        stop_event: threading.Event,
+        emit: StatusCallback,
+        label: str,
+    ) -> bool:
+        last_second: int | None = None
+        while self._now() < target_at:
+            if stop_event.is_set():
+                return False
+            remaining = target_at - self._now()
+            now_second = int(remaining.total_seconds())
+            if now_second != last_second:
+                emit(f"{label}: {format_countdown(remaining)}")
+                last_second = now_second
+            await self.sleep_callable(min(0.25, max(0.05, remaining.total_seconds())))
+        return True
+
+    @staticmethod
+    def _extract_flood_wait_seconds(error: Exception) -> int | None:
+        name = error.__class__.__name__
+        if "FloodWait" not in name:
+            return None
+        seconds_value = getattr(error, "seconds", None)
+        if isinstance(seconds_value, int):
+            return max(seconds_value, 0)
+        return None
+
+    @staticmethod
+    def _is_permission_error(error: Exception) -> bool:
+        return error.__class__.__name__ in {
+            "ChatWriteForbiddenError",
+            "UserBannedInChannelError",
+            "ChatAdminRequiredError",
+            "ChannelPrivateError",
+        }
+
+    @staticmethod
+    def _is_auth_error(error: Exception) -> bool:
+        return error.__class__.__name__ in {
+            "AuthKeyUnregisteredError",
+            "UnauthorizedError",
+            "SessionPasswordNeededError",
+            "PhoneCodeInvalidError",
+            "PhoneNumberUnoccupiedError",
+            "UserDeactivatedError",
+        }
+
+    @staticmethod
+    def _result(
+        status: RunStatus,
+        first_attempt_at: datetime | None,
+        success_at: datetime | None,
+        attempts_count: int,
+        details: str | None,
+    ) -> RunResult:
+        return RunResult(
+            status=status,
+            first_attempt_at=first_attempt_at,
+            success_at=success_at,
+            attempts_count=attempts_count,
+            details=details,
+        )
