@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from telethon import TelegramClient
+from telethon import TelegramClient, errors as telethon_errors
 from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 
@@ -53,13 +53,80 @@ async def login_with_qr(
         await client.disconnect()
 
 
+async def login_with_phone_code(
+    api_id: int,
+    api_hash: str,
+    phone_number: str,
+    code_callback: Callable[[], str | None],
+    password_callback: Callable[[], str | None] | None = None,
+    status_callback: Callable[[str], None] | None = None,
+) -> LoginResult:
+    normalized_phone = phone_number.strip()
+    if not normalized_phone:
+        raise RuntimeError("Numero de celular obrigatorio.")
+
+    client = TelegramClient(StringSession(), api_id, api_hash)
+    await client.connect()
+    try:
+        try:
+            sent_code = await client.send_code_request(normalized_phone)
+        except telethon_errors.PhoneNumberInvalidError as error:
+            raise RuntimeError(
+                "Numero de celular invalido. Use o formato internacional, ex: +5511999999999."
+            ) from error
+
+        _emit_status(status_callback, "Codigo enviado. Informe o codigo recebido no Telegram.")
+        code = (code_callback() or "").strip()
+        if not code:
+            raise RuntimeError("Login cancelado: codigo nao informado.")
+
+        phone_code_hash = getattr(sent_code, "phone_code_hash", None)
+        try:
+            await client.sign_in(
+                phone=normalized_phone,
+                code=code,
+                phone_code_hash=phone_code_hash,
+            )
+        except telethon_errors.PhoneCodeInvalidError as error:
+            raise RuntimeError("Codigo invalido. Tente novamente.") from error
+        except telethon_errors.PhoneCodeExpiredError as error:
+            raise RuntimeError("Codigo expirado. Solicite um novo codigo.") from error
+        except telethon_errors.SessionPasswordNeededError:
+            if password_callback is None:
+                raise RuntimeError("Esta conta exige senha de duas etapas (2FA).")
+            _emit_status(status_callback, "Conta com 2FA detectada. Informe a senha.")
+            password = (password_callback() or "").strip()
+            if not password:
+                raise RuntimeError("Login cancelado: senha 2FA nao informada.")
+            try:
+                await client.sign_in(password=password)
+            except telethon_errors.PasswordHashInvalidError as error:
+                raise RuntimeError("Senha 2FA invalida.") from error
+
+        me = await client.get_me()
+        if me is None:
+            raise RuntimeError("Nao foi possivel obter dados da conta apos login.")
+        session_string = client.session.save()
+        display_name = _compose_display_name(me.first_name, me.last_name, me.id)
+        return LoginResult(
+            profile_id=str(me.id),
+            display_name=display_name,
+            user_id=me.id,
+            username=getattr(me, "username", None),
+            phone=getattr(me, "phone", None),
+            session_string=session_string,
+        )
+    finally:
+        await client.disconnect()
+
+
 async def list_groups(session_string: str, api_id: int, api_hash: str) -> list[TelegramGroup]:
     client = build_client(session_string, api_id, api_hash)
     await client.connect()
     try:
         authorized = await client.is_user_authorized()
         if not authorized:
-            raise RuntimeError("Sessao nao autorizada. Refaca o login via QR.")
+            raise RuntimeError("Sessao nao autorizada. Refaca o login.")
 
         groups: list[TelegramGroup] = []
         async for dialog in client.iter_dialogs():
@@ -88,6 +155,12 @@ def _compose_display_name(first_name: str | None, last_name: str | None, user_id
     if pieces:
         return f"{' '.join(pieces)} ({user_id})"
     return f"Conta {user_id}"
+
+
+def _emit_status(callback: Callable[[str], None] | None, message: str) -> None:
+    if callback is None:
+        return
+    callback(message)
 
 
 def _dialog_to_group(dialog) -> TelegramGroup | None:

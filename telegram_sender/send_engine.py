@@ -75,7 +75,7 @@ class SendEngine:
                     first_attempt_at,
                     None,
                     attempts_count,
-                    "Sessao nao autorizada. Refaca login via QR.",
+                    "Sessao nao autorizada. Refaca o login.",
                 )
 
             group_entity = await client.get_entity(run_config.group_id)

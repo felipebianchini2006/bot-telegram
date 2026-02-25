@@ -1,6 +1,10 @@
+import asyncio
+import types as pytypes
+
 from telethon import types
 from telethon.utils import get_peer_id
 
+import telegram_sender.telegram_auth as telegram_auth
 from telegram_sender.telegram_auth import _dialog_to_group
 
 
@@ -103,3 +107,140 @@ def test_dialog_to_group_excludes_private_chat() -> None:
     )
     dialog = DummyDialog("Contato", is_group=False, is_channel=False, entity=entity)
     assert _dialog_to_group(dialog) is None
+
+
+def test_login_with_phone_code_success(monkeypatch) -> None:
+    class DummyErrors:
+        class PhoneNumberInvalidError(Exception):
+            pass
+
+        class PhoneCodeInvalidError(Exception):
+            pass
+
+        class PhoneCodeExpiredError(Exception):
+            pass
+
+        class SessionPasswordNeededError(Exception):
+            pass
+
+        class PasswordHashInvalidError(Exception):
+            pass
+
+    class FakeSession:
+        @staticmethod
+        def save() -> str:
+            return "session-123"
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            self.session = FakeSession()
+            self.disconnect_called = False
+
+        async def connect(self) -> None:
+            return
+
+        async def disconnect(self) -> None:
+            self.disconnect_called = True
+
+        async def send_code_request(self, _phone: str):
+            return pytypes.SimpleNamespace(phone_code_hash="hash-1")
+
+        async def sign_in(self, **_kwargs) -> None:
+            return
+
+        async def get_me(self):
+            return pytypes.SimpleNamespace(
+                id=123,
+                first_name="Maria",
+                last_name="Silva",
+                username="maria",
+                phone="+5511999999999",
+            )
+
+    monkeypatch.setattr(telegram_auth, "telethon_errors", DummyErrors)
+    monkeypatch.setattr(telegram_auth, "TelegramClient", FakeClient)
+
+    statuses: list[str] = []
+    result = asyncio.run(
+        telegram_auth.login_with_phone_code(
+            api_id=1,
+            api_hash="hash",
+            phone_number="+5511999999999",
+            code_callback=lambda: "12345",
+            status_callback=statuses.append,
+        )
+    )
+    assert result.profile_id == "123"
+    assert result.display_name == "Maria Silva (123)"
+    assert result.username == "maria"
+    assert result.phone == "+5511999999999"
+    assert result.session_string == "session-123"
+    assert "Codigo enviado. Informe o codigo recebido no Telegram." in statuses
+
+
+def test_login_with_phone_code_requires_2fa(monkeypatch) -> None:
+    class DummyErrors:
+        class PhoneNumberInvalidError(Exception):
+            pass
+
+        class PhoneCodeInvalidError(Exception):
+            pass
+
+        class PhoneCodeExpiredError(Exception):
+            pass
+
+        class SessionPasswordNeededError(Exception):
+            pass
+
+        class PasswordHashInvalidError(Exception):
+            pass
+
+    class FakeSession:
+        @staticmethod
+        def save() -> str:
+            return "session-2fa"
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            self.session = FakeSession()
+            self._first_sign_in_call = True
+
+        async def connect(self) -> None:
+            return
+
+        async def disconnect(self) -> None:
+            return
+
+        async def send_code_request(self, _phone: str):
+            return pytypes.SimpleNamespace(phone_code_hash="hash-2")
+
+        async def sign_in(self, **kwargs) -> None:
+            if "password" in kwargs:
+                return
+            if self._first_sign_in_call:
+                self._first_sign_in_call = False
+                raise DummyErrors.SessionPasswordNeededError()
+
+        async def get_me(self):
+            return pytypes.SimpleNamespace(
+                id=999,
+                first_name="Conta",
+                last_name=None,
+                username=None,
+                phone="+5511888888888",
+            )
+
+    monkeypatch.setattr(telegram_auth, "telethon_errors", DummyErrors)
+    monkeypatch.setattr(telegram_auth, "TelegramClient", FakeClient)
+
+    result = asyncio.run(
+        telegram_auth.login_with_phone_code(
+            api_id=1,
+            api_hash="hash",
+            phone_number="+5511888888888",
+            code_callback=lambda: "67890",
+            password_callback=lambda: "senha-2fa",
+        )
+    )
+    assert result.profile_id == "999"
+    assert result.display_name == "Conta (999)"

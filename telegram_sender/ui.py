@@ -16,7 +16,7 @@ from telegram_sender.paths import APP_CONFIG_PATH, PROFILES_PATH, RUNS_LOG_PATH,
 from telegram_sender.security import SessionVault, SessionVaultError
 from telegram_sender.send_engine import SendEngine
 from telegram_sender.storage import AppConfigStore, ProfileStore, RunLogger
-from telegram_sender.telegram_auth import LoginResult, list_groups, login_with_qr
+from telegram_sender.telegram_auth import LoginResult, list_groups, login_with_phone_code, login_with_qr
 from telegram_sender.time_engine import check_clock_drift, timezone_summary
 
 
@@ -86,8 +86,14 @@ class TelegramSenderApp:
 
         self.login_button = ttk.Button(profile_frame, text="Novo login via QR", command=self._start_qr_login)
         self.login_button.grid(row=0, column=1, padx=(8, 0))
+        self.login_phone_button = ttk.Button(
+            profile_frame,
+            text="Novo login por celular",
+            command=self._start_phone_login,
+        )
+        self.login_phone_button.grid(row=0, column=2, padx=(8, 0))
         self.load_groups_button = ttk.Button(profile_frame, text="Carregar grupos", command=self._load_groups_for_profile)
-        self.load_groups_button.grid(row=0, column=2, padx=(8, 0))
+        self.load_groups_button.grid(row=0, column=3, padx=(8, 0))
 
         group_frame = ttk.LabelFrame(container, text="Grupo alvo", padding=10)
         group_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -217,24 +223,7 @@ class TelegramSenderApp:
 
         def on_success(result: LoginResult) -> None:
             self._close_qr_window()
-            profile = Profile(
-                profile_id=result.profile_id,
-                display_name=result.display_name,
-                user_id=result.user_id,
-                username=result.username,
-                phone=result.phone,
-                last_used_at=datetime.now().astimezone().isoformat(),
-            )
-            self.profile_store.upsert(profile)
-            self.vault.set_session(profile.profile_id, result.session_string)
-            self.vault.save()
-            self._reload_profiles()
-
-            for label, item in self.profile_items.items():
-                if item.profile_id == profile.profile_id:
-                    self.profile_var.set(label)
-                    break
-
+            profile = self._persist_login_result(result)
             self._set_ui_busy(False)
             self._append_status(f"Login concluido para {profile.display_name}.")
 
@@ -246,6 +235,63 @@ class TelegramSenderApp:
 
         self._run_coroutine(
             login_with_qr(config.api_id, config.api_hash, qr_callback=on_qr_url),
+            on_success,
+            on_error,
+        )
+
+    def _start_phone_login(self) -> None:
+        config = self._read_config_from_form(show_errors=True)
+        if config is None:
+            return
+
+        phone_input = self._ask_string(
+            title="Login Telegram por celular",
+            prompt="Digite o numero no formato internacional (ex: +5511999999999):",
+        )
+        if phone_input is None:
+            return
+        phone = phone_input.strip()
+        if not phone:
+            messagebox.showerror("Erro", "Numero de celular obrigatorio.", parent=self.root)
+            return
+
+        self._set_ui_busy(True, f"Solicitando codigo para {phone}...")
+
+        def code_callback() -> str | None:
+            return self._ask_string(
+                title="Codigo do Telegram",
+                prompt="Digite o codigo recebido no Telegram:",
+            )
+
+        def password_callback() -> str | None:
+            return self._ask_string(
+                title="Senha 2FA",
+                prompt="Digite a senha de duas etapas:",
+                show="*",
+            )
+
+        def status_callback(message: str) -> None:
+            self.root.after(0, lambda text=message: self._append_status(text))
+
+        def on_success(result: LoginResult) -> None:
+            profile = self._persist_login_result(result)
+            self._set_ui_busy(False)
+            self._append_status(f"Login por celular concluido para {profile.display_name}.")
+
+        def on_error(error: Exception) -> None:
+            self._set_ui_busy(False)
+            messagebox.showerror("Erro de login", str(error), parent=self.root)
+            self._append_status(f"Falha no login por celular: {error}")
+
+        self._run_coroutine(
+            login_with_phone_code(
+                api_id=config.api_id,
+                api_hash=config.api_hash,
+                phone_number=phone,
+                code_callback=code_callback,
+                password_callback=password_callback,
+                status_callback=status_callback,
+            ),
             on_success,
             on_error,
         )
@@ -262,7 +308,7 @@ class TelegramSenderApp:
 
         session_string = self.vault.get_session(profile.profile_id)
         if session_string is None:
-            messagebox.showerror("Erro", "Sessao nao encontrada. Refaca login via QR.", parent=self.root)
+            messagebox.showerror("Erro", "Sessao nao encontrada. Refaca o login.", parent=self.root)
             return
 
         self._set_ui_busy(True, "Carregando grupos da conta...")
@@ -412,10 +458,12 @@ class TelegramSenderApp:
         self.start_button.config(state="disabled" if running else "normal")
         self.stop_button.config(state="normal" if running else "disabled")
         self.login_button.config(state="disabled" if running else "normal")
+        self.login_phone_button.config(state="disabled" if running else "normal")
         self.load_groups_button.config(state="disabled" if running else "normal")
 
     def _set_ui_busy(self, busy: bool, status_message: str | None = None) -> None:
         self.login_button.config(state="disabled" if busy else "normal")
+        self.login_phone_button.config(state="disabled" if busy else "normal")
         self.load_groups_button.config(state="disabled" if busy else "normal")
         self.start_button.config(state="disabled" if busy else "normal")
         if status_message:
@@ -442,6 +490,41 @@ class TelegramSenderApp:
     def _selected_profile(self) -> Profile | None:
         selected = self.profile_var.get().strip()
         return self.profile_items.get(selected)
+
+    def _persist_login_result(self, result: LoginResult) -> Profile:
+        profile = Profile(
+            profile_id=result.profile_id,
+            display_name=result.display_name,
+            user_id=result.user_id,
+            username=result.username,
+            phone=result.phone,
+            last_used_at=datetime.now().astimezone().isoformat(),
+        )
+        self.profile_store.upsert(profile)
+        self.vault.set_session(profile.profile_id, result.session_string)
+        self.vault.save()
+        self._reload_profiles()
+
+        for label, item in self.profile_items.items():
+            if item.profile_id == profile.profile_id:
+                self.profile_var.set(label)
+                break
+        return profile
+
+    def _ask_string(self, title: str, prompt: str, show: str | None = None) -> str | None:
+        if threading.current_thread() is threading.main_thread():
+            return simpledialog.askstring(title, prompt, show=show, parent=self.root)
+
+        response_holder: dict[str, str | None] = {"value": None}
+        response_ready = threading.Event()
+
+        def ask_on_ui() -> None:
+            response_holder["value"] = simpledialog.askstring(title, prompt, show=show, parent=self.root)
+            response_ready.set()
+
+        self.root.after(0, ask_on_ui)
+        response_ready.wait()
+        return response_holder["value"]
 
     def _run_coroutine(
         self,

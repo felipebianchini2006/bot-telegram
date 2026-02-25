@@ -30,7 +30,7 @@ python app.py
 
 1. Abrir app e informar senha mestra local.
 2. Informar `API ID` e `API Hash`.
-3. Clicar em `Novo login via QR` para autenticar a conta.
+3. Clicar em `Novo login via QR` ou `Novo login por celular` para autenticar a conta.
 4. Selecionar perfil carregado.
 5. Clicar em `Carregar grupos` e escolher o grupo alvo.
 6. Informar mensagem e horario (`HH:MM:SS`).
@@ -51,4 +51,3 @@ python app.py
 ```
 
 Saida esperada: `dist\TelegramSenderMVP.exe`
-
