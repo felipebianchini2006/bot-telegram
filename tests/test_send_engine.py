@@ -27,6 +27,10 @@ class ChatWriteForbiddenError(Exception):
     pass
 
 
+class ChannelPrivateError(Exception):
+    pass
+
+
 class FakeClient:
     def __init__(self, outcomes: list[Any]):
         self.outcomes = outcomes
@@ -106,9 +110,51 @@ def test_send_engine_floodwait_exceeded() -> None:
     assert result.attempts_count == 1
 
 
-def test_send_engine_permission_error() -> None:
+def test_send_engine_retryable_permission_error_recovers() -> None:
     clock = FakeClock(datetime(2026, 2, 24, 18, 59, 59, tzinfo=timezone.utc))
-    fake_client = FakeClient(outcomes=[ChatWriteForbiddenError("sem permissao")])
+    fake_client = FakeClient(
+        outcomes=[
+            ChatWriteForbiddenError("grupo fechado"),
+            ChatWriteForbiddenError("grupo fechado"),
+            {"id": 1},
+        ]
+    )
+    config = RunConfig(
+        profile_id="1",
+        group_id=123,
+        message_text="Katia x Rodolfo",
+        target_time_local="19:00:00",
+        warmup_seconds=0,
+        retry_min_ms=50,
+        retry_max_ms=50,
+        max_attempt_window_sec=5,
+    )
+    result = _run(config, fake_client, clock)
+    assert result.status == RunStatus.SUCCESS
+    assert result.attempts_count == 3
+
+
+def test_send_engine_retryable_permission_error_exhausts_window() -> None:
+    clock = FakeClock(datetime(2026, 2, 24, 18, 59, 59, tzinfo=timezone.utc))
+    fake_client = FakeClient(outcomes=[ChatWriteForbiddenError("grupo fechado")] * 200)
+    config = RunConfig(
+        profile_id="1",
+        group_id=123,
+        message_text="Katia x Rodolfo",
+        target_time_local="19:00:00",
+        warmup_seconds=0,
+        retry_min_ms=50,
+        retry_max_ms=50,
+        max_attempt_window_sec=1,
+    )
+    result = _run(config, fake_client, clock)
+    assert result.status == RunStatus.PERMISSION_ERROR
+    assert result.attempts_count > 1
+
+
+def test_send_engine_permission_error_terminal() -> None:
+    clock = FakeClock(datetime(2026, 2, 24, 18, 59, 59, tzinfo=timezone.utc))
+    fake_client = FakeClient(outcomes=[ChannelPrivateError("sem permissao")])
     config = RunConfig(
         profile_id="1",
         group_id=123,
@@ -122,4 +168,3 @@ def test_send_engine_permission_error() -> None:
     result = _run(config, fake_client, clock)
     assert result.status == RunStatus.PERMISSION_ERROR
     assert result.attempts_count == 1
-

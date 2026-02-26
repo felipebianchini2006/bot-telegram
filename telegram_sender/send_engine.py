@@ -41,6 +41,7 @@ class SendEngine:
         emit = status_callback or (lambda message: None)
         stop = stop_event or threading.Event()
         first_attempt_at: datetime | None = None
+        last_permission_error: Exception | None = None
         attempts_count = 0
 
         target_at = compute_target_datetime(
@@ -155,6 +156,27 @@ class SendEngine:
                         continue
 
                     if self._is_permission_error(error):
+                        if self._is_retryable_permission_error(error):
+                            last_permission_error = error
+                            remaining_seconds = max((deadline - now()).total_seconds(), 0.0)
+                            if remaining_seconds <= 0:
+                                return self._result(
+                                    RunStatus.PERMISSION_ERROR,
+                                    first_attempt_at,
+                                    None,
+                                    attempts_count,
+                                    str(error),
+                                )
+                            wait_seconds = min(
+                                self.uniform_callable(run_config.retry_min_ms, run_config.retry_max_ms) / 1000.0,
+                                remaining_seconds,
+                            )
+                            emit(
+                                "Permissao temporariamente negada; "
+                                f"nova tentativa em {wait_seconds * 1000:.0f}ms."
+                            )
+                            await self.sleep_callable(wait_seconds)
+                            continue
                         return self._result(
                             RunStatus.PERMISSION_ERROR,
                             first_attempt_at,
@@ -186,6 +208,14 @@ class SendEngine:
                     await self.sleep_callable(wait_seconds)
                     continue
 
+            if last_permission_error is not None:
+                return self._result(
+                    RunStatus.PERMISSION_ERROR,
+                    first_attempt_at,
+                    None,
+                    attempts_count,
+                    str(last_permission_error),
+                )
             return self._result(
                 RunStatus.TIMEOUT,
                 first_attempt_at,
@@ -239,16 +269,37 @@ class SendEngine:
         label: str,
     ) -> bool:
         last_second: int | None = None
-        while self._now() < target_at:
+        busy_wait_window_seconds = 0.010
+
+        while True:
             if stop_event.is_set():
                 return False
-            remaining = target_at - self._now()
+            now_value = self._now()
+            if now_value >= target_at:
+                return True
+
+            remaining = target_at - now_value
             now_second = int(remaining.total_seconds())
             if now_second != last_second:
                 emit(f"{label}: {format_countdown(remaining)}")
                 last_second = now_second
-            await self.sleep_callable(min(0.25, max(0.05, remaining.total_seconds())))
-        return True
+
+            remaining_seconds = remaining.total_seconds()
+            if remaining_seconds <= busy_wait_window_seconds:
+                # Espera ativa apenas nos milissegundos finais para minimizar atraso de disparo.
+                current = now_value
+                while current < target_at:
+                    if stop_event.is_set():
+                        return False
+                    candidate = self._now()
+                    if candidate <= current:
+                        # Fallback para relogios simulados que nao avancam sem sleep explicito.
+                        await self.sleep_callable(0.0005)
+                        candidate = self._now()
+                    current = candidate
+                return True
+
+            await self.sleep_callable(min(0.25, max(0.001, remaining_seconds - busy_wait_window_seconds)))
 
     @staticmethod
     def _extract_flood_wait_seconds(error: Exception) -> int | None:
@@ -267,6 +318,12 @@ class SendEngine:
             "UserBannedInChannelError",
             "ChatAdminRequiredError",
             "ChannelPrivateError",
+        }
+
+    @staticmethod
+    def _is_retryable_permission_error(error: Exception) -> bool:
+        return error.__class__.__name__ in {
+            "ChatWriteForbiddenError",
         }
 
     @staticmethod
