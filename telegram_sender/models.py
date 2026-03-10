@@ -28,6 +28,11 @@ class RunConfig:
     retry_min_ms: int = 50
     retry_max_ms: int = 100
     max_attempt_window_sec: int = 300
+    race_mode: bool = False
+    pre_fire_seconds: int = 0
+    race_retry_ms: int = 5
+    status_throttle_ms: int = 500
+    keepalive_interval_sec: int = 15
 
     def validate(self) -> None:
         if not self.profile_id.strip():
@@ -49,6 +54,14 @@ class RunConfig:
             raise ValueError("retry_max_ms deve ser >= retry_min_ms.")
         if self.max_attempt_window_sec <= 0:
             raise ValueError("max_attempt_window_sec deve ser > 0.")
+        if self.pre_fire_seconds < 0 or self.pre_fire_seconds > 60:
+            raise ValueError("pre_fire_seconds deve ser entre 0 e 60.")
+        if self.race_retry_ms < 1 or self.race_retry_ms > 50:
+            raise ValueError("race_retry_ms deve ser entre 1 e 50.")
+        if self.status_throttle_ms < 50 or self.status_throttle_ms > 5000:
+            raise ValueError("status_throttle_ms deve ser entre 50 e 5000.")
+        if self.keepalive_interval_sec < 0 or self.keepalive_interval_sec > 120:
+            raise ValueError("keepalive_interval_sec deve ser entre 0 e 120.")
 
 
 @dataclass(slots=True)

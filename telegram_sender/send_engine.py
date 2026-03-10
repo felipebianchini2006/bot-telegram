@@ -42,6 +42,7 @@ class SendEngine:
         stop = stop_event or threading.Event()
         first_attempt_at: datetime | None = None
         last_permission_error: Exception | None = None
+        last_status_emit_at: datetime | None = None
         attempts_count = 0
 
         target_at = compute_target_datetime(
@@ -97,12 +98,20 @@ class SendEngine:
                 )
             emit("Warmup iniciado. Conexao estabilizada.")
 
-            target_ready = await self._wait_until(
-                target_at,
-                stop,
-                emit,
-                "Aguardando horario alvo",
-            )
+            if run_config.race_mode and run_config.pre_fire_seconds > 0:
+                fire_at = target_at - timedelta(seconds=run_config.pre_fire_seconds)
+                emit(f"Modo corrida: pre-fire {run_config.pre_fire_seconds}s antes do alvo.")
+            else:
+                fire_at = target_at
+
+            if run_config.race_mode and run_config.keepalive_interval_sec > 0:
+                target_ready = await self._wait_with_keepalive(
+                    fire_at, stop, emit, client, run_config.keepalive_interval_sec,
+                )
+            else:
+                target_ready = await self._wait_until(
+                    fire_at, stop, emit, "Aguardando horario alvo",
+                )
             if not target_ready:
                 return self._result(
                     RunStatus.TIMEOUT,
@@ -131,6 +140,9 @@ class SendEngine:
                     await client.send_message(group_entity, run_config.message_text)
                     success_at = now()
                     emit(f"Mensagem enviada com sucesso na tentativa {attempts_count}.")
+                    if run_config.race_mode and first_attempt_at is not None:
+                        elapsed = (success_at - first_attempt_at).total_seconds()
+                        emit(f"Corrida finalizada: {attempts_count} tentativas em {elapsed:.3f}s.")
                     return self._result(
                         RunStatus.SUCCESS,
                         first_attempt_at,
@@ -167,14 +179,29 @@ class SendEngine:
                                     attempts_count,
                                     str(error),
                                 )
-                            wait_seconds = min(
-                                self.uniform_callable(run_config.retry_min_ms, run_config.retry_max_ms) / 1000.0,
-                                remaining_seconds,
-                            )
-                            emit(
-                                "Permissao temporariamente negada; "
-                                f"nova tentativa em {wait_seconds * 1000:.0f}ms."
-                            )
+
+                            if run_config.race_mode:
+                                wait_seconds = min(
+                                    run_config.race_retry_ms / 1000.0,
+                                    remaining_seconds,
+                                )
+                                now_ts = now()
+                                if last_status_emit_at is None or (now_ts - last_status_emit_at).total_seconds() >= run_config.status_throttle_ms / 1000.0:
+                                    emit(
+                                        f"Corrida: tentativa {attempts_count}, "
+                                        f"restam {remaining_seconds:.1f}s."
+                                    )
+                                    last_status_emit_at = now_ts
+                            else:
+                                wait_seconds = min(
+                                    self.uniform_callable(run_config.retry_min_ms, run_config.retry_max_ms) / 1000.0,
+                                    remaining_seconds,
+                                )
+                                emit(
+                                    "Permissao temporariamente negada; "
+                                    f"nova tentativa em {wait_seconds * 1000:.0f}ms."
+                                )
+
                             await self.sleep_callable(wait_seconds)
                             continue
                         return self._result(
@@ -260,6 +287,33 @@ class SendEngine:
             await client.disconnect()
         except Exception:  # noqa: BLE001
             return
+
+    async def _wait_with_keepalive(
+        self,
+        target_at: datetime,
+        stop_event: threading.Event,
+        emit: StatusCallback,
+        client: Any,
+        keepalive_interval_sec: int,
+    ) -> bool:
+        while True:
+            now_value = self._now()
+            if now_value >= target_at:
+                return True
+            remaining = (target_at - now_value).total_seconds()
+            wait_chunk = min(remaining, float(keepalive_interval_sec))
+            chunk_target = now_value + timedelta(seconds=wait_chunk)
+            ready = await self._wait_until(chunk_target, stop_event, emit, "Aguardando horario alvo")
+            if not ready:
+                return False
+            if self._now() < target_at:
+                try:
+                    await client.get_me()
+                except Exception:  # noqa: BLE001
+                    emit("Keep-alive falhou, tentando reconectar...")
+                    reconnected = await self._reconnect(client, emit)
+                    if not reconnected:
+                        emit("Reconexao apos keep-alive falhou.")
 
     async def _wait_until(
         self,

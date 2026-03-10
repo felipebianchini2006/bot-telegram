@@ -48,6 +48,9 @@ class TelegramSenderApp:
         self.group_var = tk.StringVar()
         self.target_time_var = tk.StringVar(value="19:00:00")
         self.timezone_var = tk.StringVar(value="")
+        self.race_mode_var = tk.BooleanVar(value=False)
+        self.pre_fire_var = tk.StringVar(value="5")
+        self.race_retry_var = tk.StringVar(value="5")
 
         self._build_layout()
         self._load_initial_data()
@@ -59,7 +62,7 @@ class TelegramSenderApp:
         container = ttk.Frame(self.root, padding=12)
         container.grid(row=0, column=0, sticky="nsew")
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(6, weight=1)
+        container.rowconfigure(7, weight=1)
 
         credentials = ttk.LabelFrame(container, text="Credenciais Telegram API", padding=10)
         credentials.grid(row=0, column=0, sticky="ew")
@@ -110,22 +113,40 @@ class TelegramSenderApp:
         ttk.Button(schedule_frame, text="Validar relogio", command=self._validate_clock).grid(row=0, column=2, sticky="w")
         ttk.Label(schedule_frame, textvariable=self.timezone_var).grid(row=0, column=3, sticky="e")
 
+        race_frame = ttk.LabelFrame(container, text="Modo corrida (race mode)", padding=10)
+        race_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+
+        race_check = ttk.Checkbutton(
+            race_frame, text="Ativar modo corrida",
+            variable=self.race_mode_var,
+            command=self._toggle_race_fields,
+        )
+        race_check.grid(row=0, column=0, sticky="w", padx=(0, 12))
+
+        ttk.Label(race_frame, text="Pre-fire (s)").grid(row=0, column=1, sticky="w")
+        self.pre_fire_entry = ttk.Entry(race_frame, textvariable=self.pre_fire_var, width=6, state="disabled")
+        self.pre_fire_entry.grid(row=0, column=2, sticky="w", padx=(4, 12))
+
+        ttk.Label(race_frame, text="Retry (ms)").grid(row=0, column=3, sticky="w")
+        self.race_retry_entry = ttk.Entry(race_frame, textvariable=self.race_retry_var, width=6, state="disabled")
+        self.race_retry_entry.grid(row=0, column=4, sticky="w", padx=(4, 0))
+
         message_frame = ttk.LabelFrame(container, text="Mensagem", padding=10)
-        message_frame.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        message_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
         message_frame.columnconfigure(0, weight=1)
         message_frame.rowconfigure(0, weight=1)
         self.message_text = ScrolledText(message_frame, height=6, wrap="word")
         self.message_text.grid(row=0, column=0, sticky="nsew")
 
         actions = ttk.Frame(container)
-        actions.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        actions.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         self.start_button = ttk.Button(actions, text="Iniciar rodada", command=self._start_run)
         self.start_button.grid(row=0, column=0, sticky="w")
         self.stop_button = ttk.Button(actions, text="Parar", command=self._stop_run, state="disabled")
         self.stop_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
         status_frame = ttk.LabelFrame(container, text="Status da execucao", padding=10)
-        status_frame.grid(row=6, column=0, sticky="nsew", pady=(10, 0))
+        status_frame.grid(row=7, column=0, sticky="nsew", pady=(10, 0))
         status_frame.columnconfigure(0, weight=1)
         status_frame.rowconfigure(0, weight=1)
         self.status_text = ScrolledText(status_frame, height=14, wrap="word", state="disabled")
@@ -361,6 +382,11 @@ class TelegramSenderApp:
         if not is_probably_sp:
             self._append_status("Aviso: fuso local nao parece Sao Paulo. Verifique antes de disparar.")
 
+    def _toggle_race_fields(self) -> None:
+        state = "normal" if self.race_mode_var.get() else "disabled"
+        self.pre_fire_entry.config(state=state)
+        self.race_retry_entry.config(state=state)
+
     def _start_run(self) -> None:
         if self.run_thread is not None and self.run_thread.is_alive():
             messagebox.showwarning("Execucao em andamento", "Ja existe uma rodada ativa.", parent=self.root)
@@ -386,15 +412,19 @@ class TelegramSenderApp:
             )
 
         message_text = self.message_text.get("1.0", "end").strip()
-        run_config = RunConfig(
-            profile_id=profile.profile_id,
-            group_id=selected_group.group_id,
-            message_text=message_text,
-            target_time_local=self.target_time_var.get().strip(),
-        )
+        race_mode = self.race_mode_var.get()
         try:
+            run_config = RunConfig(
+                profile_id=profile.profile_id,
+                group_id=selected_group.group_id,
+                message_text=message_text,
+                target_time_local=self.target_time_var.get().strip(),
+                race_mode=race_mode,
+                pre_fire_seconds=int(self.pre_fire_var.get()) if race_mode else 0,
+                race_retry_ms=int(self.race_retry_var.get()) if race_mode else 5,
+            )
             run_config.validate()
-        except ValueError as error:
+        except (TypeError, ValueError) as error:
             messagebox.showerror("Erro de validacao", str(error), parent=self.root)
             return
 
